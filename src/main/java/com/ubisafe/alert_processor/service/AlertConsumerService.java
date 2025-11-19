@@ -1,96 +1,64 @@
 package com.ubisafe.alert_processor.service;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import com.ubisafe.alert_processor.domain.Alert;
-import com.ubisafe.alert_processor.domain.AlertEntity;
-import com.ubisafe.alert_processor.domain.ProcessingStatus;
 import com.ubisafe.alert_processor.exception.AlertProcessingException;
-import com.ubisafe.alert_processor.repository.AlertRepository;
+import com.ubisafe.alert_processor.exception.InvalidAlertJsonException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.time.LocalDateTime;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class AlertConsumerService {
 
-    private final AlertRepository alertRepository;
-    private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
     private static final long PROCESSING_DELAY_MS = 500;
 
+    private final AlertService alertService;
+    private final AlertFailureService alertFailureService;
+
+    /**
+     * Consumer Kafka responsável apenas por orquestrar o fluxo de processamento.
+     * A lógica de negócio e de persistência fica em serviços dedicados.
+     * -
+     * A transação é gerenciada pelos serviços de aplicação, não pelo listener.
+     * O commit de offset do Kafka ocorre apenas quando o método retorna sem exceção.
+     */
     @KafkaListener(topics = "alerts", groupId = "processor-group")
-    @Transactional
     public void consumeAlert(String alertJson) {
-        AlertEntity entity = null;
+        log.info("Received alert from Kafka: {}", alertJson);
+
         try {
-            log.info("Received alert from Kafka: {}", alertJson);
-
-            // Deserialize alert
-            Alert alert = objectMapper.readValue(alertJson, Alert.class);
-
-            // Simulate processing delay
             Thread.sleep(PROCESSING_DELAY_MS);
 
-            // Convert to entity and persist
-            entity = AlertEntity.builder()
-                    .id(alert.getId())
-                    .clientId(alert.getClientId())
-                    .alertType(alert.getAlertType())
-                    .message(alert.getMessage())
-                    .severity(alert.getSeverity())
-                    .source(alert.getSource())
-                    .timestamp(alert.getTimestamp())
-                    .processedAt(LocalDateTime.now())
-                    .processingStatus(ProcessingStatus.SUCCESS)
-                    .build();
+            alertService.processAlert(alertJson);
 
-            alertRepository.save(entity);
-
-            log.info("Alert processed and saved successfully: id={}, type={}, severity={}",
-                    entity.getId(), entity.getAlertType(), entity.getSeverity());
+            log.info("Alert processed and saved successfully.");
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            log.error("Processing interrupted for alert: {}", alertJson, e);
-            persistFailedAlert(entity, alertJson, "Alert processing was interrupted: " + e.getMessage());
+            String reason = "Alert processing was interrupted: " + e.getMessage();
+            log.error(reason, e);
+            alertFailureService.registerFailureFromAlertJson(alertJson, reason);
             throw new AlertProcessingException("Alert processing was interrupted", e);
-        } catch (Exception e) {
-            log.error("Error processing alert: {}", alertJson, e);
-            persistFailedAlert(entity, alertJson, "Failed to process alert: " + e.getMessage());
-            throw new AlertProcessingException("Failed to process alert", e);
-        }
-    }
 
-    private void persistFailedAlert(AlertEntity entity, String alertJson, String failureReason) {
-        try {
-            if (entity == null) {
-                Alert alert = objectMapper.readValue(alertJson, Alert.class);
-                entity = AlertEntity.builder()
-                        .id(alert.getId())
-                        .clientId(alert.getClientId())
-                        .alertType(alert.getAlertType())
-                        .message(alert.getMessage())
-                        .severity(alert.getSeverity())
-                        .source(alert.getSource())
-                        .timestamp(alert.getTimestamp())
-                        .processedAt(LocalDateTime.now())
-                        .processingStatus(ProcessingStatus.FAILURE)
-                        .failureReason(failureReason)
-                        .build();
-            } else {
-                entity.setProcessingStatus(ProcessingStatus.FAILURE);
-                entity.setFailureReason(failureReason);
-            }
-            alertRepository.save(entity);
-            log.info("Failed alert saved: id={}, reason={}", entity.getId(), failureReason);
+        } catch (InvalidAlertJsonException e) {
+            String reason = e.getMessage();
+            log.error("Invalid JSON error: {}", reason, e);
+            alertFailureService.registerFailureFromRawPayload(alertJson, reason);
+            throw e;
+
+        } catch (AlertProcessingException e) {
+            String reason = e.getMessage();
+            log.error("Business/technical processing error: {}", reason, e);
+            alertFailureService.registerFailureFromAlertJson(alertJson, reason);
+            throw e;
+
         } catch (Exception e) {
-            log.error("Failed to persist error alert: {}", alertJson, e);
+            String reason = "Failed to process alert: " + e.getMessage();
+            log.error(reason, e);
+            alertFailureService.registerFailureFromAlertJson(alertJson, reason);
+            throw new AlertProcessingException("Failed to process alert", e);
         }
     }
 }
