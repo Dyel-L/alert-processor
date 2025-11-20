@@ -9,6 +9,7 @@ import com.ubisafe.alert_processor.repository.AlertRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -39,13 +40,14 @@ public class AlertService {
         try {
             Alert alert = objectMapper.readValue(alertJson, Alert.class);
 
-            if (alertRepository.existsById(alert.getId())) {
-                log.warn("Alert {} já processado anteriormente. Ignorando duplicata.", alert.getId());
-                return alertRepository.findById(alert.getId()).orElseThrow();
-            }
-
             AlertEntity entity = alertMapper.toSuccessEntity(alert);
-            return alertRepository.save(entity);
+            try {
+                return alertRepository.save(entity);
+            } catch (DataIntegrityViolationException e) {
+                log.warn("Alert {} já existe (violação de chave única). Recuperando existente.", alert.getId());
+                return alertRepository.findById(alert.getId())
+                        .orElseThrow(() -> new AlertProcessingException("Alert exists but cannot be retrieved", e));
+            }
 
         } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
             log.warn("Erro de desserialização de Alert. Payload inválido.");
